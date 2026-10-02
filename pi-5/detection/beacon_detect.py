@@ -51,11 +51,16 @@ PORT = 8000
 TRACKING_ENABLED = True  # set False to go back to view only
 UART_PORT = "/dev/ttyAMA0"
 HOME_PAN, HOME_TILT = 90, 30   # where the gimbal starts and returns to
-KP_PAN = 0.1             # how hard to correct per pixel of error (Argus used 0.3)
-KP_TILT = 0.1
-ALPHA = 0.1              # smoothing: 0.1 means move 10% of the way each frame
-DEAD_ZONE = 20           # ignore errors smaller than this many pixels
-LOST_TIMEOUT = 2.0       # seconds without the beacon before returning home
+
+# Snap mode: measure while still, jump once, wait, measure again.
+DEG_PER_PIXEL = 0.08     # ESTIMATE: how many degrees one pixel is. Calibrate this!
+SNAP_GAIN = 0.8          # jump 80% of the way, so it lands slightly short instead
+                         # of overshooting. The next snap fixes the rest.
+PAN_DIR = -1             # flip to +1 if pan jumps AWAY from the beacon
+TILT_DIR = -1            # flip to +1 if tilt jumps AWAY from the beacon
+SETTLE_TIME = 0.4        # seconds to wait for the servos to stop after a jump
+DEAD_ZONE = 20           # within this many pixels of center counts as locked
+LOST_TIMEOUT = 3.0       # seconds without the beacon before returning home
 
 
 # Camera setup
@@ -94,6 +99,12 @@ class BeaconFinder:
     def __init__(self):
         self.frames = deque()  # last second of grayscale frames
         self.times = deque()   # the exact time each one was captured
+
+    def reset(self):
+        """Throw away the history. Called after every jump, because frames
+        taken before or during the move show the beacon in the wrong place."""
+        self.frames.clear()
+        self.times.clear()
 
     def update(self, frame, t):
         """Feed in one new frame. Returns the beacon's (x, y) position
@@ -163,19 +174,13 @@ class BeaconFinder:
         return (cx + 0.5) * (w / SMALL_WIDTH), (cy + 0.5) * (h / small_h)
 
 
-# Gimbal control, same math as Argus
+# Gimbal control: snap mode
 
-def aim(pan, tilt, err_x, err_y):
-    """Nudge pan and tilt so the beacon moves toward the frame center.
-    err_x, err_y: how many pixels the beacon is from center."""
-    target_pan = pan - err_x * KP_PAN if abs(err_x) > DEAD_ZONE else pan
-    target_tilt = tilt - err_y * KP_TILT if abs(err_y) > DEAD_ZONE else tilt
-
-    # Smoothing: only move part of the way toward the target each frame,
-    # so the gimbal glides instead of jerking.
-    pan = (1 - ALPHA) * pan + ALPHA * target_pan
-    tilt = (1 - ALPHA) * tilt + ALPHA * target_tilt
-
+def snap(pan, tilt, err_x, err_y):
+    """Turn a pixel error into an angle jump. err_x, err_y: how many pixels
+    the beacon is from the frame center. Returns the new pan and tilt."""
+    pan += PAN_DIR * err_x * DEG_PER_PIXEL * SNAP_GAIN
+    tilt += TILT_DIR * err_y * DEG_PER_PIXEL * SNAP_GAIN
     # Servos only go from 0 to 180 degrees.
     pan = max(0, min(180, pan))
     tilt = max(0, min(180, tilt))
@@ -200,7 +205,7 @@ def camera_loop():
     if TRACKING_ENABLED:
         uart = ESP32UART(UART_PORT, 115200, timeout=0.5)
         uart.send_angles(pan, tilt)
-    last_sent = (int(pan), int(tilt))
+    settle_until = time.monotonic() + SETTLE_TIME
 
     while True:
         ok, frame = cam.read()
@@ -210,32 +215,46 @@ def camera_loop():
 
         now = time.monotonic()
         frame_times.append(now)
-        target = finder.update(frame, now)
-
-        # Draw a small white cross at the center of the frame. Later, the
-        # gimbal's job will be to move the red crosshair onto this.
         h, w = frame.shape[:2]
+
+        # While the servos are still moving, skip detection entirely.
+        # Those frames are smeared and would only confuse the detector.
+        if now < settle_until:
+            target = None
+            status = "moving"
+        else:
+            target = finder.update(frame, now)
+            status = "searching"
+
+        # White cross: the frame center, where we want the beacon to end up.
         cv2.drawMarker(frame, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
 
         if target is not None:
             x, y = int(target[0]), int(target[1])
             cv2.circle(frame, (x, y), 15, (0, 0, 255), 2)
             cv2.drawMarker(frame, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
-            status = f"BEACON at ({x}, {y})"
-            pan, tilt = aim(pan, tilt, x - w / 2, y - h / 2)
             last_seen = now
-        else:
-            status = "searching"
-            if now - last_seen > LOST_TIMEOUT:
-                pan, tilt = HOME_PAN, HOME_TILT
+            err_x, err_y = x - w / 2, y - h / 2
 
-        # Only send over UART when the whole degree value actually changes,
-        # so we don't flood the ESP32 with identical messages.
-        if uart is not None:
-            angles = (int(pan), int(tilt))
-            if angles != last_sent:
-                uart.send_angles(*angles)
-                last_sent = angles
+            if abs(err_x) <= DEAD_ZONE and abs(err_y) <= DEAD_ZONE:
+                status = "LOCKED"
+            else:
+                status = f"snapping (off by {err_x:.0f}, {err_y:.0f} px)"
+                if uart is not None:
+                    pan, tilt = snap(pan, tilt, err_x, err_y)
+                    uart.send_angles(pan, tilt)
+                    finder.reset()                     # old frames are now wrong
+                    settle_until = now + SETTLE_TIME   # wait for servos to stop
+
+        elif status == "searching" and now - last_seen > LOST_TIMEOUT:
+            # Lost the beacon for a while: go home and start over.
+            if uart is not None and (pan, tilt) != (HOME_PAN, HOME_TILT):
+                pan, tilt = HOME_PAN, HOME_TILT
+                uart.send_angles(pan, tilt)
+                finder.reset()
+                settle_until = now + SETTLE_TIME
+            last_seen = now
+
         status += f"   pan {pan:.0f} tilt {tilt:.0f}"
 
         # Show the real frame rate, so we can confirm we're holding 30 fps.
