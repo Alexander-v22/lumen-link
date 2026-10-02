@@ -12,7 +12,9 @@ pixel ask "does this pixel turn on and off exactly 5 times per second?"
 The beacon does. Room lights, people, and screens don't.
 """
 
+import os
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -22,6 +24,11 @@ import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 import uvicorn
+
+# This file lives in pi-5/detection, but esp_comms lives in pi-5. This line
+# tells Python to also look one folder up, so the import below works.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from esp_comms.uart_con import ESP32UART
 
 
 # Settings: change these numbers to tune the detector
@@ -38,6 +45,17 @@ MIN_SCORE = 0.5          # how "pure" the 5 Hz flicker must be, 0 to 1 (clean LE
 MIN_AMPLITUDE = 15       # how strong the flicker must be, in brightness levels (0 to 255)
 
 PORT = 8000
+
+# Gimbal tracking settings
+
+TRACKING_ENABLED = True  # set False to go back to view only
+UART_PORT = "/dev/ttyAMA0"
+HOME_PAN, HOME_TILT = 90, 30   # where the gimbal starts and returns to
+KP_PAN = 0.1             # how hard to correct per pixel of error (Argus used 0.3)
+KP_TILT = 0.1
+ALPHA = 0.1              # smoothing: 0.1 means move 10% of the way each frame
+DEAD_ZONE = 20           # ignore errors smaller than this many pixels
+LOST_TIMEOUT = 2.0       # seconds without the beacon before returning home
 
 
 # Camera setup
@@ -145,6 +163,25 @@ class BeaconFinder:
         return (cx + 0.5) * (w / SMALL_WIDTH), (cy + 0.5) * (h / small_h)
 
 
+# Gimbal control, same math as Argus
+
+def aim(pan, tilt, err_x, err_y):
+    """Nudge pan and tilt so the beacon moves toward the frame center.
+    err_x, err_y: how many pixels the beacon is from center."""
+    target_pan = pan - err_x * KP_PAN if abs(err_x) > DEAD_ZONE else pan
+    target_tilt = tilt - err_y * KP_TILT if abs(err_y) > DEAD_ZONE else tilt
+
+    # Smoothing: only move part of the way toward the target each frame,
+    # so the gimbal glides instead of jerking.
+    pan = (1 - ALPHA) * pan + ALPHA * target_pan
+    tilt = (1 - ALPHA) * tilt + ALPHA * target_tilt
+
+    # Servos only go from 0 to 180 degrees.
+    pan = max(0, min(180, pan))
+    tilt = max(0, min(180, tilt))
+    return pan, tilt
+
+
 # Main loop: runs in the background, always grabbing and analyzing frames
 
 latest_jpeg = None
@@ -156,6 +193,14 @@ def camera_loop():
     cam = open_camera()
     finder = BeaconFinder()
     frame_times = deque(maxlen=30)
+
+    pan, tilt = HOME_PAN, HOME_TILT
+    last_seen = time.monotonic()
+    uart = None
+    if TRACKING_ENABLED:
+        uart = ESP32UART(UART_PORT, 115200, timeout=0.5)
+        uart.send_angles(pan, tilt)
+    last_sent = (int(pan), int(tilt))
 
     while True:
         ok, frame = cam.read()
@@ -177,8 +222,21 @@ def camera_loop():
             cv2.circle(frame, (x, y), 15, (0, 0, 255), 2)
             cv2.drawMarker(frame, (x, y), (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
             status = f"BEACON at ({x}, {y})"
+            pan, tilt = aim(pan, tilt, x - w / 2, y - h / 2)
+            last_seen = now
         else:
             status = "searching"
+            if now - last_seen > LOST_TIMEOUT:
+                pan, tilt = HOME_PAN, HOME_TILT
+
+        # Only send over UART when the whole degree value actually changes,
+        # so we don't flood the ESP32 with identical messages.
+        if uart is not None:
+            angles = (int(pan), int(tilt))
+            if angles != last_sent:
+                uart.send_angles(*angles)
+                last_sent = angles
+        status += f"   pan {pan:.0f} tilt {tilt:.0f}"
 
         # Show the real frame rate, so we can confirm we're holding 30 fps.
         fps = 0.0
